@@ -2,6 +2,8 @@ local ran_before
 
 
 return function(options)
+  local json = require("cjson").encode
+  ngx.log(ngx.ERR, "gp:", json(options))
 
   if ran_before then
     ngx.log(ngx.WARN, debug.traceback("attempt to re-run the globalpatches", 2))
