@@ -2,6 +2,8 @@ local ran_before
 
 
 return function(options)
+  local json = require("cjson").encode
+  ngx.log(ngx.ERR, "gp:", json(options))
 
   if ran_before then
     ngx.log(ngx.WARN, debug.traceback("attempt to re-run the globalpatches", 2))
@@ -91,6 +93,12 @@ return function(options)
       _timerng = require("resty.timerng").new({
         min_threads = 16,
         max_threads = 32,
+        -- It avoids adding physical timers in test cases with the wheel over
+        -- 10,000 years.
+        wheel_setting = {
+          level = 7,
+          slots_for_each_level = { 10, 60, 60, 24, 365, 100, 100 },
+        },
       })
 
       _timerng:start()
@@ -246,17 +254,19 @@ return function(options)
       -- See https://github.com/openresty/resty-cli/pull/12
       -- for a definitive solution of using shms in CLI
       local SharedDict = {}
-      local function set(data, key, value, expire_at)
+      local function set(data, key, value, expire_at, flags)
         data[key] = {
           value = value,
-          info = {expire_at = expire_at}
+          info = {expire_at = expire_at, flags=flags}
         }
         return data[key]
       end
+      local function is_stale(item)
+        return item.info.expire_at and item.info.expire_at <= ngx.now()
+      end
       local function get(data, key)
         local item = data[key]
-        if item and item.info.expire_at and item.info.expire_at <= ngx.now() then
-          data[key] = nil
+        if item and is_stale(item) then
           item = nil
         end
         return item
@@ -272,9 +282,18 @@ return function(options)
       end
       function SharedDict:get(key)
         local item = get(self.data, key)
-        return item and item.value, nil
+        if item then
+          return item.value, item.info.flags
+        end
+        return nil
       end
-      SharedDict.get_stale = SharedDict.get
+      function SharedDict:get_stale(key)
+        local item = self.data[key]
+        if item then
+          return item.value, item.info.flags, is_stale(item)
+        end
+        return nil
+      end
       function SharedDict:set(key, value, exptime)
         local expire_at = (exptime and exptime ~= 0) and (ngx.now() + exptime)
         set(self.data, key, value, expire_at)
@@ -325,7 +344,7 @@ return function(options)
         local flushed = 0
 
         for key, item in pairs(self.data) do
-          if item.info.expire_at and item.info.expire_at <= ngx.now() then
+          if is_stale(item) then
             data[key] = nil
             flushed = flushed + 1
             if n and flushed == n then
@@ -341,9 +360,7 @@ return function(options)
         local i = 0
         local keys = {}
         for k, item in pairs(self.data) do
-          if item.info.expire_at and item.info.expire_at <= ngx.now() then
-            self.data[k] = nil
-          else
+          if not is_stale(item) then
             keys[#keys+1] = k
             i = i + 1
             if n ~= 0 and i == n then

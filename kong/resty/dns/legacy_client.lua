@@ -19,23 +19,17 @@
 -- @author Thijs Schreijer
 -- @license Apache 2.0
 
--- ngx.log(ngx.ERR, "dns checking: ", kong, 
---   ", ", tostring(kong.configuration),
---   ", ", tostring(kong.configuration.legacy_dns_client))
-
-if kong and kong.configuration and kong.configuration.legacy_dns_client then
-  ngx.log(ngx.ERR, "The legacy client dns library was loaded.")
-  return require("kong.resty.dns.legacy_client")
-end
-
 local _
 local utils = require("kong.resty.dns.utils")
 local fileexists = require("pl.path").exists
-local mlcache = require("kong.resty.mlcache")
+local semaphore = require("ngx.semaphore").new
+local lrucache = require("resty.lrucache")
 local resolver = require("resty.dns.resolver")
+local cycle_aware_deep_copy = require("kong.tools.utils").cycle_aware_deep_copy
 local req_dyn_hook = require("kong.dynamic_hook")
 local time = ngx.now
 local log = ngx.log
+local ERR = ngx.ERR
 local WARN = ngx.WARN
 local ALERT = ngx.ALERT
 local DEBUG = ngx.DEBUG
@@ -46,6 +40,7 @@ local PREFIX = "[dns-client] "
 local timer_at = ngx.timer.at
 
 local math_min = math.min
+local math_max = math.max
 local math_fmod = math.fmod
 local math_random = math.random
 local table_remove = table.remove
@@ -141,10 +136,10 @@ local dnscache
 -- @param qname name to lookup
 -- @param qtype type number, any of the TYPE_xxx constants
 -- @return cached record or nil
-local cachelookup = function(qname, qtype, callback)
+local cachelookup = function(qname, qtype)
   local now = time()
   local key = qtype..":"..qname
-  local cached, err, hit_level = dnscache:get(key, nil, callback)
+  local cached = dnscache:get(key)
 
   local ctx = ngx.ctx
   if ctx and ctx.has_timing then
@@ -167,17 +162,22 @@ local cachelookup = function(qname, qtype, callback)
     --]]
   end
 
-  return cached, err, hit_level
+  return cached
 end
 
-
-local function cache_entry_ttl(entry, qname, qtype)
-  local key, ttl
+-- inserts an entry in the cache.
+-- @param entry the dns record list to store (may also be an error entry)
+-- @param qname the name under which to store the record (optional for records, not for errors)
+-- @param qtype the query type for which to store the record (optional for records, not for errors)
+-- @return nothing
+local cacheinsert = function(entry, qname, qtype)
+  local key, lru_ttl
   local now = time()
   local e1 = entry[1]
 
   if not entry.expire then
     -- new record not seen before
+    local ttl
     if e1 then
       -- an actual, non-empty, record
       key = (qtype or e1.type) .. ":" .. (qname or e1.name)
@@ -224,7 +224,7 @@ local function cache_entry_ttl(entry, qname, qtype)
         --[[
         log(DEBUG, PREFIX, "cache set (skip on empty): ", key, " ", frecord(entry))
         --]]
-        return nil
+        return
       end
       ttl = emptyTtl
       key = qtype..":"..qname
@@ -232,39 +232,25 @@ local function cache_entry_ttl(entry, qname, qtype)
 
     -- set expire time
     entry.touch = now
+    entry.ttl = ttl
     entry.expire = now + ttl
+    entry.expired = false
+    lru_ttl = ttl + staleTtl
     --[[
     log(DEBUG, PREFIX, "cache set (new): ", key, " ", frecord(entry))
     --]]
 
   else
-
     -- an existing record reinserted (under a shortname for example)
     -- must calculate remaining ttl, cannot get it from lrucache
     key = (qtype or e1.type) .. ":" .. (qname or e1.name)
-    ttl = entry.expire - now
+    lru_ttl = entry.expire - now + staleTtl
     --[[
     log(DEBUG, PREFIX, "cache set (existing): ", key, " ", frecord(entry))
     --]]
   end
 
-  return key, ttl
-end
-
-
--- inserts an entry in the cache.
--- @param entry the dns record list to store (may also be an error entry)
--- @param qname the name under which to store the record (optional for records, not for errors)
--- @param qtype the query type for which to store the record (optional for records, not for errors)
--- @return nothing
-local cacheinsert = function(entry, qname, qtype)
-
-  local key, ttl = cache_entry_ttl(entry, qname, qtype)
-  if not key then
-    return
-  end
-
-  if ttl <= 0 then
+  if lru_ttl <= 0 then
     -- item is already expired, so we do not add it
     dnscache:delete(key)
     --[[
@@ -273,7 +259,7 @@ local cacheinsert = function(entry, qname, qtype)
     return
   end
 
-  dnscache:set(key, entry, ttl)
+  dnscache:set(key, entry, lru_ttl)
 end
 
 -- Lookup a shortname in the cache.
@@ -281,21 +267,7 @@ end
 -- @param qtype (optional) if not given a non-type specific query is done
 -- @return same as cachelookup
 local function cacheShortLookup(qname, qtype)
-  local shortlookup_callback = function ()
-    local key = (qtype or "none") .. ":short:" .. qname
-    local ttl, err, value, went_stale = dnscache:peek(key, true)
-    if value and not err and went_stale and not value.expired then
-      ttl = (ttl or 0) + staleTtl
-      if ttl > 0 then
-        value.expired = true
-        value.expire = time() + ttl
-        return value, nil, ttl
-      end
-    end
-    return nil, "not found"
-  end
-
-  return cachelookup("short:" .. qname, qtype or "none", shortlookup_callback)
+  return cachelookup("short:" .. qname, qtype or "none")
 end
 
 -- Inserts a shortname in the cache.
@@ -497,9 +469,6 @@ local resolve_max_wait
 --        })
 -- )
 _M.init = function(options)
-  ngx.log(ngx.ERR, "dns checking: ", kong, 
-   ", ", tostring(kong.configuration),
-   ", ", tostring(kong.configuration.legacy_dns_client))
 
   log(DEBUG, PREFIX, "(re)configuring dns client")
   local resolv, hosts, err
@@ -512,53 +481,7 @@ _M.init = function(options)
   noSynchronisation = options.noSynchronisation
   log(DEBUG, PREFIX, "noSynchronisation = ", tostring(noSynchronisation))
 
-  -- Deal with the `resolv.conf` file
-
-  local resolvconffile = options.resolvConf or utils.DEFAULT_RESOLV_CONF
-
-  if ((type(resolvconffile) == "string") and (fileexists(resolvconffile)) or
-     (type(resolvconffile) == "table")) then
-    resolv, err = utils.applyEnv(utils.parseResolvConf(resolvconffile))
-    if not resolv then return resolv, err end
-  else
-    log(WARN, PREFIX, "Resolv.conf file not found: "..tostring(resolvconffile))
-    resolv = {}
-  end
-  if not resolv.options then resolv.options = {} end
-
-  if not options.timeout then
-    if resolv.options.timeout then
-      options.timeout = resolv.options.timeout * 1000
-    else
-      options.timeout = 2000  -- 2000 is openresty default
-    end
-  end
-  log(DEBUG, PREFIX, "timeout = ", options.timeout, " ms")
-
-  options.retrans = options.retrans or resolv.options.attempts or 5 -- 5 is openresty default
-  log(DEBUG, PREFIX, "attempts = ", options.retrans)
-
-  -- maximum time to wait for the dns resolver to hit its timeouts
-  -- + 1s to ensure some delay in timer execution and semaphore return are accounted for
-  resolve_max_wait = options.timeout / 1000 * options.retrans + 1
-
-  dnscache = assert(mlcache.new("dns_cache", "kong_dns_cache", {
-              lru_size = cacheSize,   -- size of the L1 (Lua VM) cache
-              ttl      = nil,         -- ttl for hits
-              neg_ttl  = nil,         -- ttl for misses
-              ipc_shm  = "kong_dns_cache_ipc",
-              resurrect_ttl = nil,    -- controlled by myself, not using staleTtl
-              resty_lock_opts = {
-                timeout = resolve_max_wait,
-                exptimeout = resolve_max_wait + 1,
-              },
-             }))
-  dnscache:purge(true)                -- clear cache on (re)initialization
-  dnscache.orig_set = dnscache.set
-  dnscache.set = function (self, key, value, ttl)
-    self:orig_set(key, {ttl = ttl or 0}, value)
-  end
-
+  dnscache = lrucache.new(cacheSize)  -- clear cache on (re)initialization
   defined_hosts = {}  -- reset hosts hash table
 
   local order = options.order or orderValids
@@ -641,7 +564,20 @@ _M.init = function(options)
   validTtl = options.validTtl
   log(DEBUG, PREFIX, "validTtl = ", tostring(validTtl))
 
-  -- init options.nameservers
+  -- Deal with the `resolv.conf` file
+
+  local resolvconffile = options.resolvConf or utils.DEFAULT_RESOLV_CONF
+
+  if ((type(resolvconffile) == "string") and (fileexists(resolvconffile)) or
+     (type(resolvconffile) == "table")) then
+    resolv, err = utils.applyEnv(utils.parseResolvConf(resolvconffile))
+    if not resolv then return resolv, err end
+  else
+    log(WARN, PREFIX, "Resolv.conf file not found: "..tostring(resolvconffile))
+    resolv = {}
+  end
+  if not resolv.options then resolv.options = {} end
+
   if #(options.nameservers or {}) == 0 and resolv.nameserver then
     options.nameservers = {}
     -- some systems support port numbers in nameserver entries, so must parse those
@@ -671,12 +607,24 @@ _M.init = function(options)
     end
   end
 
+  options.retrans = options.retrans or resolv.options.attempts or 5 -- 5 is openresty default
+  log(DEBUG, PREFIX, "attempts = ", options.retrans)
+
   if options.no_random == nil then
     options.no_random = not resolv.options.rotate
   else
     options.no_random = not not options.no_random -- force to boolean
   end
   log(DEBUG, PREFIX, "no_random = ", options.no_random)
+
+  if not options.timeout then
+    if resolv.options.timeout then
+      options.timeout = resolv.options.timeout * 1000
+    else
+      options.timeout = 2000  -- 2000 is openresty default
+    end
+  end
+  log(DEBUG, PREFIX, "timeout = ", options.timeout, " ms")
 
   -- setup the search order
   options.ndots = options.ndots or resolv.options.ndots or 1
@@ -701,6 +649,10 @@ _M.init = function(options)
   -- options.no_recurse = -- not touching this one for now
 
   config = options -- store it in our module level global
+
+  -- maximum time to wait for the dns resolver to hit its timeouts
+  -- + 1s to ensure some delay in timer execution and semaphore return are accounted for
+  resolve_max_wait = options.timeout / 1000 * options.retrans + 1
 
   return true
 end
@@ -752,6 +704,10 @@ local function parseAnswer(qname, qtype, answers, try_list)
       end
     end
   end
+
+  -- now insert actual target record in cache
+  cacheinsert(answers, qname, qtype)
+  return true
 end
 
 
@@ -778,24 +734,71 @@ local function individualQuery(qname, r_opts, try_list)
   -- resolver:destroy is patched in build phase, more information can be found in
   -- build/openresty/patches/lua-resty-dns-0.22_01-destroy_resolver.patch
   r:destroy()
-
-  if result then
-    parseAnswer(qname, r_opts.qtype, result, try_list)
+  if not result then
+    return result, err, try_list
   end
 
-  return result, err, try_list
+  parseAnswer(qname, r_opts.qtype, result, try_list)
+
+  return result, nil, try_list
+end
+
+local queue = setmetatable({}, {__mode = "v"})
+
+local function enqueue_query(key, qname, r_opts, try_list)
+  local item = {
+    key = key,
+    semaphore = semaphore(),
+    qname = qname,
+    r_opts = cycle_aware_deep_copy(r_opts),
+    try_list = try_list,
+    expire_time = time() + resolve_max_wait,
+  }
+  queue[key] = item
+  return item
+end
+
+
+local function dequeue_query(item)
+  if queue[item.key] == item then
+    -- query done, but by now many others might be waiting for our result.
+    -- 1) stop new ones from adding to our lock/semaphore
+    queue[item.key] = nil
+    -- 2) release all waiting threads
+    item.semaphore:post(math_max(item.semaphore:count() * -1, 1))
+    item.semaphore = nil
+  end
+end
+
+
+local function queue_get_query(key, try_list)
+  local item = queue[key]
+
+  if not item then
+    return nil
+  end
+
+  -- bug checks: release it actively if the waiting query queue is blocked
+  if item.expire_time < time() then
+    local err = "stale query, key:" ..  key
+    add_status_to_try_list(try_list, err)
+    log(ALERT, PREFIX, err)
+    dequeue_query(item)
+    return nil
+  end
+
+  return item
 end
 
 
 -- to be called as a timer-callback, performs a query and returns the results
 -- in the `item` table.
-local function executeQuery(premature, qname, r_opts, try_list)
+local function executeQuery(premature, item)
   if premature then return end
 
-  local result = individualQuery(qname, r_opts, try_list)
-  if result then
-    cacheinsert(result, qname, r_opts.qtype)
-  end
+  item.result, item.err = individualQuery(item.qname, item.r_opts, item.try_list)
+
+  dequeue_query(item)
 end
 
 
@@ -808,18 +811,91 @@ end
 -- `semaphore` field that can be used to wait for completion (once complete
 -- the `semaphore` field will be removed). Upon error it returns `nil+error`.
 local function asyncQuery(qname, r_opts, try_list)
-  local ok, err = timer_at(0, executeQuery, qname, r_opts, try_list)
+  local key = qname..":"..r_opts.qtype
+  local item = queue_get_query(key, try_list)
+  if item then
+    --[[
+    log(DEBUG, PREFIX, "Query async (exists): ", key, " ", fquery(item))
+    --]]
+    add_status_to_try_list(try_list, "in progress (async)")
+    return item    -- already in progress, return existing query
+  end
+
+  item = enqueue_query(key, qname, r_opts, try_list)
+
+  local ok, err = timer_at(0, executeQuery, item)
   if not ok then
-    log(ALERT, PREFIX, "Failed to create a timer: ", err)
-    return
+    queue[key] = nil
+    log(ERR, PREFIX, "Failed to create a timer: ", err)
+    return nil, "asyncQuery failed to create timer: "..err
   end
   --[[
-  local key = qname..":"..r_opts.qtype
   log(DEBUG, PREFIX, "Query async (scheduled): ", key, " ", fquery(item))
   --]]
   add_status_to_try_list(try_list, "scheduled")
+
+  return item
 end
 
+
+-- schedules a sync query.
+-- This will be synchronized, so multiple calls (sync or async) might result in 1 query.
+-- The maximum delay would be `options.timeout * options.retrans`.
+-- @param qname the name to query for
+-- @param r_opts a table with the query options
+-- @param try_list the try_list object to add to
+-- @return `result + nil + try_list`, or `nil + err + try_list` in case of errors
+local function syncQuery(qname, r_opts, try_list)
+  local key = qname..":"..r_opts.qtype
+
+  local item = queue_get_query(key, try_list)
+
+  -- If nothing is in progress, we start a new sync query
+  if not item then
+    item = enqueue_query(key, qname, r_opts, try_list)
+
+    item.result, item.err = individualQuery(qname, item.r_opts, try_list)
+
+    dequeue_query(item)
+
+    return item.result, item.err, try_list
+  end
+
+  -- If the query is already in progress, we wait for it.
+
+  add_status_to_try_list(try_list, "in progress (sync)")
+
+  -- block and wait for the async query to complete
+  local ok, err = item.semaphore:wait(resolve_max_wait)
+  if ok and item.result then
+    -- we were released, and have a query result from the
+    -- other thread, so all is well, return it
+    --[[
+    log(DEBUG, PREFIX, "Query sync result: ", key, " ", fquery(item),
+           " result: ", json({ result = item.result, err = item.err}))
+    --]]
+    return item.result, item.err, try_list
+  end
+
+  -- bug checks
+  if not ok and not item.err then
+    item.err = err  -- only first expired wait() reports error
+    log(ALERT, PREFIX, "semaphore:wait(", resolve_max_wait, ") failed: ", err,
+                       ", count: ", item.semaphore and item.semaphore:count(),
+                       ", qname: ", qname)
+  end
+
+  err = err or item.err or "unknown"
+  add_status_to_try_list(try_list, "error: "..err)
+
+  -- don't block on the same thread again, so remove it from the queue
+  if queue[key] == item then
+    queue[key] = nil
+  end
+
+  -- there was an error, either a semaphore timeout, or a lookup error
+  return nil, err
+end
 
 -- will lookup a name in the cache, or alternatively query the nameservers.
 -- If nothing is in the cache, a synchronous query is performewd. If the cache
@@ -832,69 +908,40 @@ end
 -- @param try_list the try_list object to add to
 -- @return `entry + nil + try_list`, or `nil + err + try_list`
 local function lookup(qname, r_opts, dnsCacheOnly, try_list)
-  local qtype = r_opts.qtype
-
-  local lookup_callback = function ()
-
-    local key = qtype .. ":" .. qname
-
-    local ttl, err, value, went_stale = dnscache:peek(key, true)
-    if value and not err and went_stale and not value.expired then
-
-      try_list = try_add(try_list, qname, qtype, "cache-hit")
-      add_status_to_try_list(try_list, "stale")
-
-      -- Try to fix the synchronous issue of mlcache:peek, some other process
-      -- may flush out the expired data. For more details, see KAG-3390
-      ttl = (ttl or 0) + staleTtl
-
-      if ttl > 0 then
-        asyncQuery(qname, r_opts, try_list)
-        value.expired = true
-        value.expire = time() + ttl
-
-        return value, nil, ttl
-      end
-    end
-
-    try_list = try_add(try_list, qname, qtype, "cache-miss")
-
-    local entry, err = individualQuery(qname, r_opts, try_list)
-    if not entry then
-      cachesetsuccess(qname, nil)
-      return nil, err
-    end
-
-    local entry_key, ttl = cache_entry_ttl(entry, qname, qtype)
-    if key ~= entry_key then
-      dnscache:set(entry_key, entry, ttl)
-      return nil, "empty result", emptyTtl
-    end
-
-    return entry, nil, ttl
-  end
-
-  local entry, err, hit_level = cachelookup(qname, qtype,
-                                  (not dnsCacheOnly) and lookup_callback or nil)
+  local entry = cachelookup(qname, r_opts.qtype)
   if not entry then
+    --not found in cache
     if dnsCacheOnly then
+      -- we can't do a lookup, so return an error
+      --[[
+      log(DEBUG, PREFIX, "Lookup, cache only failure: ", qname, " = ", r_opts.qtype)
+      --]]
       try_list = try_add(try_list, qname, r_opts.qtype, "cache only lookup failed")
       return {
         errcode = 100,
         errstr = clientErrors[100]
       }, nil, try_list
     end
-    return nil, err, try_list
-  end
-
-  if hit_level == 1 or hit_level == 2 then
-    try_list = try_add(try_list, qname, qtype, "cache-hit")
-    if entry.expired then
-      add_status_to_try_list(try_list, "stale")
+    -- perform a sync lookup, as we have no stale data to fall back to
+    try_list = try_add(try_list, qname, r_opts.qtype, "cache-miss")
+    -- while kong is exiting, we cannot use timers and hence we run all our queries without synchronization
+    if noSynchronisation then
+      return individualQuery(qname, r_opts, try_list)
+    elseif ngx.worker and ngx.worker.exiting() then
+      log(DEBUG, PREFIX, "DNS query not synchronized because the worker is shutting down")
+      return individualQuery(qname, r_opts, try_list)
     end
+    return syncQuery(qname, r_opts, try_list)
   end
 
-  return entry, err, try_list
+  try_list = try_add(try_list, qname, r_opts.qtype, "cache-hit")
+  if entry.expired then
+    -- the cached record is stale but usable, so we do a refresh query in the background
+    add_status_to_try_list(try_list, "stale")
+    asyncQuery(qname, r_opts, try_list)
+  end
+
+  return entry, nil, try_list
 end
 
 -- checks the query to be a valid IPv6. Inserts it in the cache or inserts
@@ -949,7 +996,6 @@ local function check_ipv6(qname, qtype, try_list)
   cacheinsert(record, qname, qtype)
   return record, nil, try_list
 end
-
 
 -- checks the query to be a valid IPv4. Inserts it in the cache or inserts
 -- an error if it is invalid

@@ -204,7 +204,8 @@ describe("[DNS client cache]", function()
       -- resolve again, now getting same record, but stale, this will trigger
       -- background refresh query
       local result2 = client.resolve("myhost6")
-      assert.equal(result2, result)
+      assert.equal(result2[1].address, result[1].address)
+      assert.falsy(result.expired)
       assert.is_true(result2.expired)  -- stale; marked as expired
 
       -- wait for refresh to complete
@@ -213,7 +214,7 @@ describe("[DNS client cache]", function()
       -- resolve and check whether we got the new record from the mock copy
       local result3 = client.resolve("myhost6")
       assert.not_equal(result, result3)  -- must be a different record now
-      assert.equal(result3, mock_records["myhost6.domain.com:"..client.TYPE_A])
+      assert.equal(result3[1].address, mock_records["myhost6.domain.com:"..client.TYPE_A][1].address)
 
       -- the 'result3' resolve call above will also trigger a new background query
       -- (because the sleep of 0.1 equals the records ttl of 0.1)
@@ -321,7 +322,7 @@ describe("[DNS client cache]", function()
       sleep(0.1)
       -- background resolve is now complete, check the cache, it should still have the
       -- stale record, and it should not have been replaced by the error
-      assert.equal(rec1, lrucache:get(client.TYPE_A..":myhost9.domain.com"))
+      assert.equal(rec1[1].address, lrucache:get(client.TYPE_A..":myhost9.domain.com")[1].address)
     end)
 
     it("name errors do replace stale records", function()
@@ -394,7 +395,7 @@ describe("[DNS client cache]", function()
       sleep(0.1)
       -- background resolve is now complete, check the cache, it should still have the
       -- stale record, and it should not have been replaced by the empty record
-      assert.equal(rec1, lrucache:get(client.TYPE_A..":myhost9.domain.com"))
+      assert.equal(rec1[1].address, lrucache:get(client.TYPE_A..":myhost9.domain.com")[1].address)
     end)
 
     it("AS records do replace stale records", function()

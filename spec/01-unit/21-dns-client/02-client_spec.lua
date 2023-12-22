@@ -1597,7 +1597,12 @@ describe("[DNS client]", function()
     assert.are.equal(1, call_count)
     assert.are.equal(NOT_FOUND_ERROR, err2)
     res2 = assert(client.getcache():get(client.TYPE_A..":"..qname))
-    assert.equal(res1, res2)
+    -- We have updated the new expired res2 in the shared dict,
+    -- see the logic of handling the stale value in function lookup_callback().
+    assert.not_equal(res1, res2)
+    assert.equal(res1.errcode, res2.errcode)
+    assert.equal(res1.errstr, res2.errstr)
+    assert.falsy(res1.expired)
     assert.is_true(res2.expired)  -- by now, record is marked as expired
 
 
@@ -1672,7 +1677,12 @@ describe("[DNS client]", function()
     assert.are.equal(call_count, 1)
     assert.are.equal(err1, err2)
     res2 = assert(client.getcache():get(client.TYPE_A..":"..qname))
-    assert.are.equal(res1, res2)
+    -- We have updated the new expired res2 in the shared dict,
+    -- see the logic of handling the stale value in function lookup_callback().
+    assert.are_not.equal(res1, res2)
+    assert.equal(res1.errcode, res2.errcode)
+    assert.equal(res1.errstr, res2.errstr)
+    assert.falsy(res1.expired)
     assert.is_true(res2.expired)
 
     -- wait for expiry of staleTtl and retry, 2 calls, new result
@@ -1733,6 +1743,7 @@ describe("[DNS client]", function()
       -- now count the unique responses we got
       local counters = {}
       for _, r in ipairs(results) do
+        assert.equal(r[1].address, results[1][1].address)
         r = tostring(r)
         counters[r] = (counters[r] or 0) + 1
       end
@@ -1741,7 +1752,8 @@ describe("[DNS client]", function()
 
       -- we should have a single result table, as all threads are supposed to
       -- return the exact same table.
-      assert.equal(1,count)
+      assert.equal(1, call_count)
+      assert.equal(10, count)
     end)
 
     it("timeout while waiting", function()
@@ -1807,14 +1819,14 @@ describe("[DNS client]", function()
 
       -- results[1~9] are equal, as they all will wait for the first response
       for i = 1, 9 do
-        assert.equal("timeout", results[i])
+        assert.equal("could not acquire callback lock: timeout", results[i])
       end
       -- results[10] comes from synchronous DNS access of the first request
       assert.equal(ip, results[10][1]["address"])
     end)
   end)
 
-  it("noSynchronisation == true, queries on each request", function()
+  it("noSynchronisation == true, queries on each request (deprecated)", function()
     -- basically the local function _synchronized_query
     assert(client.init({
       resolvConf = {
@@ -1870,7 +1882,7 @@ describe("[DNS client]", function()
     end
 
     -- all results are unique, each call got its own query
-    assert.equal(call_count, 10)
+    assert.equal(call_count, 1)
   end)
 
 end)

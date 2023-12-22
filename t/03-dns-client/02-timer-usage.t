@@ -1,5 +1,7 @@
 use Test::Nginx::Socket;
 
+no_long_string();
+
 plan tests => repeat_each() * (blocks() * 5);
 
 workers(1);
@@ -9,6 +11,11 @@ run_tests();
 
 __DATA__
 === TEST 1: stale result triggers async timer
+--- http_config eval
+qq {
+    lua_shared_dict kong_dns_cache              12m;
+    lua_shared_dict kong_dns_cache_ipc          12m;
+}
 --- config
     location = /t {
         access_by_lua_block {
@@ -67,7 +74,8 @@ first try_list: ["(short)konghq.com:1 - cache-miss","konghq.com:1 - cache-miss/q
 second address name: konghq.com
 second try_list: ["(short)konghq.com:1 - cache-hit/stale","konghq.com:1 - cache-hit/stale/scheduled"]
 third address name: konghq.com
-third try_list: ["(short)konghq.com:1 - cache-hit/stale","konghq.com:1 - cache-hit/stale/in progress (async)"]
+third try_list: ["(short)konghq.com:1 - cache-hit/stale","konghq.com:1 - cache-hit/stale"]
+
 --- no_error_log
 [error]
 dns lookup pool exceeded retries
